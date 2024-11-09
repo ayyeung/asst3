@@ -55,7 +55,7 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
-
+#include "circleBoxTest.cu_inl"
 
 // kernelClearImageSnowflake -- (CUDA device code)
 //
@@ -317,33 +317,24 @@ __global__ void kernelAdvanceSnowflake() {
 // given a pixel and a circle, determines the contribution to the
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
-__device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
-
+__device__ __inline__ float4
+shadePixel(int circleIndex, float2 pixelCenter, float3 p) {
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    float rad = cuConstRendererParams.radius[circleIndex];;
+    float rad = cuConstRendererParams.radius[circleIndex];
     float maxDist = rad * rad;
 
     // circle does not contribute to the image
     if (pixelDist > maxDist)
-        return;
+        return make_float4(0.f, 0.f, 0.f, 0.f);
 
     float3 rgb;
     float alpha;
 
     // there is a non-zero contribution.  Now compute the shading value
-
-    // suggestion: This conditional is in the inner loop.  Although it
-    // will evaluate the same for all threads, there is overhead in
-    // setting up the lane masks etc to implement the conditional.  It
-    // would be wise to perform this logic outside of the loop next in
-    // kernelRenderCircles.  (If feeling good about yourself, you
-    // could use some specialized template magic).
     if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
-
         const float kCircleMaxAlpha = .5f;
         const float falloffScale = 4.f;
 
@@ -351,32 +342,46 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
         rgb = lookupColor(normPixelDist);
 
         float maxAlpha = .6f + .4f * (1.f-p.z);
-        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
         alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
-
     } else {
-        // simple: each circle has an assigned color
         int index3 = 3 * circleIndex;
         rgb = *(float3*)&(cuConstRendererParams.color[index3]);
         alpha = .5f;
     }
 
-    float oneMinusAlpha = 1.f - alpha;
+    return make_float4(rgb.x, rgb.y, rgb.z, alpha);
+}
 
-    // BEGIN SHOULD-BE-ATOMIC REGION
-    // global memory read
+__device__ __inline__ void
+shadePixelSimple(float4* imgPtr, float3 rgb, float alpha) {
+    float4 newColor = make_float4(rgb.x, rgb.y, rgb.z, alpha);
+    float4 oldColor;
+    float4 blendedColor;
 
-    float4 existingColor = *imagePtr;
-    float4 newColor;
-    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
-    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
-    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
-    newColor.w = alpha + existingColor.w;
+    // Keep trying to update until we succeed
+    do {
+        // Read the old color
+        oldColor = *imgPtr;
+        
+        // Compute blended color
+        float oneMinusAlpha = 1.f - alpha;
+        blendedColor.x = alpha * rgb.x + oneMinusAlpha * oldColor.x;
+        blendedColor.y = alpha * rgb.y + oneMinusAlpha * oldColor.y;
+        blendedColor.z = alpha * rgb.z + oneMinusAlpha * oldColor.z;
+        blendedColor.w = alpha + oldColor.w * oneMinusAlpha;
+        
+        // Try to atomically update the pixel
+    } while (atomicCAS((unsigned int*)imgPtr, 
+                      __float_as_uint(oldColor.x),
+                      __float_as_uint(blendedColor.x)) != __float_as_uint(oldColor.x));
 
-    // global memory write
-    *imagePtr = newColor;
-
-    // END SHOULD-BE-ATOMIC REGION
+    // If we successfully updated x component, update the rest
+    // Use float pointer arithmetic to access individual components
+    float* floatPtr = (float*)imgPtr;
+    floatPtr[1] = blendedColor.y;
+    floatPtr[2] = blendedColor.z;
+    floatPtr[3] = blendedColor.w;
 }
 
 // kernelRenderCircles -- (CUDA device code)
@@ -384,48 +389,61 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
+
 __global__ void kernelRenderCircles() {
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (index >= cuConstRendererParams.numCircles)
+    if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight)
         return;
 
-    int index3 = 3 * index;
+    // Compute normalized coordinates of the pixel center
+    float invWidth = 1.f / cuConstRendererParams.imageWidth;
+    float invHeight = 1.f / cuConstRendererParams.imageHeight;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
 
-    // read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
+    // Load the initial pixel color into a register
+    int offset = 4 * (pixelY * cuConstRendererParams.imageWidth + pixelX);
+    float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
 
-    // compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+    // Loop through all circles and blend their colors
+    for (int circleIndex = 0; circleIndex < cuConstRendererParams.numCircles; ++circleIndex) {
+        int index3 = 3 * circleIndex;
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        float rad = cuConstRendererParams.radius[circleIndex];
 
-    // a bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+        // Perform a quick bounding box check to skip unnecessary calculations
+        float boxL = invWidth * pixelX;
+        float boxR = invWidth * (pixelX + 1);
+        float boxB = invHeight * pixelY;
+        float boxT = invHeight * (pixelY + 1);
 
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
+        if (!circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB))
+            continue;
 
-    // for all pixels in the bonding box
-    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
-            imgPtr++;
+        if (!circleInBox(p.x, p.y, rad, boxL, boxR, boxT, boxB))
+            continue;
+
+        // Calculate the contribution of the circle to this pixel
+        float4 circleColor = shadePixel(circleIndex, pixelCenterNorm, p);
+
+        // Blend the circle color with the existing pixel color
+        if (circleColor.w > 0.f) {
+            float alpha = circleColor.w;
+            float oneMinusAlpha = 1.f - alpha;
+            
+            pixelColor.x = circleColor.x * alpha + pixelColor.x * oneMinusAlpha;
+            pixelColor.y = circleColor.y * alpha + pixelColor.y * oneMinusAlpha;
+            pixelColor.z = circleColor.z * alpha + pixelColor.z * oneMinusAlpha;
+            pixelColor.w = alpha + pixelColor.w * oneMinusAlpha;
         }
     }
+
+    // Write the final pixel color back to global memory
+    *(float4*)(&cuConstRendererParams.imageData[offset]) = pixelColor;
 }
+
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -635,10 +653,10 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
-
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    dim3 blockDim(16, 16, 1);
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y);
 
     kernelRenderCircles<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
